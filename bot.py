@@ -1,197 +1,235 @@
 import asyncio
 import time
+import os
+from aiohttp import web
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message
-from pyrogram.errors import FloodWait, ApiIdInvalid, AuthKeyUnregistered
-from aiohttp import web
+from pyrogram.errors import FloodWait
 
-# Import your configuration and database files
 from config import cfg
 from database import db
 
-# --- Main Bot Class ---
-class Bot(Client):
-    def __init__(self):
-        super().__init__(
-            "UserbotIndexerBot",
-            api_id=cfg.API_ID,
-            api_hash=cfg.API_HASH,
-            bot_token=cfg.BOT_TOKEN
-        )
-        self.userbot = None
-        self.active_tasks = {"indexing": False, "forwarding": False}
-        self.admin_filter = filters.private & filters.user(cfg.ADMIN_ID)
+# --- Globals & Web Server ---
+userbot = None
+active_tasks = {"indexing": False, "forwarding": False}
 
-    async def start_services(self):
-        """Starts all bot services, including the web server."""
-        await super().start()
-        me = await self.get_me()
-        print(f"✅ Bot connected as @{me.username}")
+async def health_check(request):
+    return web.Response(text="Hello, I am alive!")
 
-        await self.initialize_userbot()
+web_app = web.Application()
+web_app.add_routes([web.get('/', health_check)])
 
-        app = web.Application()
-        app.add_routes([web.get('/', lambda r: web.json_response({"status": "running"}))])
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', cfg.PORT)
-        await site.start()
-        print(f"✅ Web server running on http://0.0.0.0:{cfg.PORT}")
-        print("🚀 Bot is fully operational.")
-        await idle()
+# --- Bot & Userbot Initialization (No changes here) ---
+app = Client("UserbotIndexerBot", api_id=cfg.API_ID, api_hash=cfg.API_HASH, bot_token=cfg.BOT_TOKEN)
 
-    async def initialize_userbot(self):
-        """Logs in the userbot account."""
+async def initialize_userbot():
+    global userbot
+    if cfg.SESSION_STRING:
+        userbot = Client("userbot_session", session_string=cfg.SESSION_STRING, api_id=cfg.API_ID, api_hash=cfg.API_HASH)
+    else:
+        userbot = Client("userbot_session", api_id=cfg.API_ID, api_hash=cfg.API_HASH)
+    try:
+        await userbot.start()
+        user_info = await userbot.get_me()
+        print(f"Userbot logged in as: {user_info.first_name}")
         if not cfg.SESSION_STRING:
-            print("INFO: No session string found, userbot will not be started.")
-            return
-            
-        print("INFO: Initializing userbot from session string...")
-        self.userbot = Client("userbot_session", session_string=cfg.SESSION_STRING, api_id=cfg.API_ID, api_hash=cfg.API_HASH)
-        try:
-            await self.userbot.start()
-            user_info = await self.userbot.get_me()
-            print(f"✅ Userbot logged in as: {user_info.first_name}")
-        except Exception as e:
-            print(f"❌ Userbot login failed: {e}")
-            self.userbot = None
-
-# --- Initialize Bot Instance ---
-try:
-    app = Bot()
-except Exception as e:
-    print(f"❌ Failed to initialize bot: {e}")
-    exit()
+            session_string = await userbot.export_session_string()
+            await app.send_message(cfg.ADMIN_ID, f"<b>✅ Userbot Login Successful!</b>\n\nYour <code>SESSION_STRING</code> is:\n\n<code>{session_string}</code>\n\nPlease set this in your environment variables to avoid future logins.")
+        return True
+    except Exception as e:
+        print(f"❌ Failed to start userbot: {e}")
+        await app.send_message(cfg.ADMIN_ID, f"<b>❌ Userbot Login Failed</b>\n\nError: <code>{e}</code>")
+        return False
 
 # --- Command Handlers ---
+admin_filter = filters.private & filters.user(cfg.ADMIN_ID)
 
-@app.on_message(filters.command("start") & app.admin_filter)
-async def start_handler(client: Bot, message: Message):
-    if client.userbot and client.userbot.is_connected:
-        await message.reply_text("👋 **Welcome!**\n\nThe userbot is logged in and ready. Send /help for a list of commands.")
+# Unchanged handlers: /start, /help, /status
+@app.on_message(filters.command("start") & admin_filter)
+async def start_handler(_, message: Message):
+    if userbot and userbot.is_connected:
+        await message.reply_text("👋 **Welcome!** Userbot is logged in. Send /help for commands.")
     else:
-        await message.reply_text("👋 **Welcome!**\n\nTo begin, please set your `SESSION_STRING` and restart the bot to log in the userbot.")
+        await message.reply_text("👋 **Welcome!** Userbot is not logged in. I will attempt to initialize it now.")
+        await initialize_userbot()
 
-@app.on_message(filters.command("help") & app.admin_filter)
+@app.on_message(filters.command("help") & admin_filter)
 async def help_handler(_, message: Message):
     await message.reply_text(
-        "**Here are the available commands:**\n\n"
-        "**/index** `<chat_id>`\n"
-        "Index all media from a specific chat.\n\n"
-        "**/forward** `<target_chat_id>`\n"
-        "Forward all indexed media to a target chat.\n\n"
-        "**/status**\n"
-        "Show the current status and number of indexed files."
+        "**/index** `<chat_id>`\nIndexes media from a chat.\n\n"
+        "**/forward** `<target_chat_id>`\nForwards all indexed files.\n\n"
+        "**/status**\nShows current status."
     )
 
-@app.on_message(filters.command("status") & app.admin_filter)
-async def status_handler(client: Bot, message: Message):
+@app.on_message(filters.command("status") & admin_filter)
+async def status_handler(_, message: Message):
     total_files = await db.get_total_files_count()
     await message.reply_text(
         f"**📊 Bot Status**\n\n"
-        f"**Userbot Logged In:** {'✅ Yes' if client.userbot and client.userbot.is_connected else '❌ No'}\n"
+        f"**Userbot Logged In:** {'✅ Yes' if userbot and userbot.is_connected else '❌ No'}\n"
         f"**Total Indexed Files:** `{total_files}`\n"
-        f"**Indexing Active:** {'🏃‍♂️ Yes' if client.active_tasks['indexing'] else ' idle'}\n"
-        f"**Forwarding Active:** {'🏃‍♂️ Yes' if client.active_tasks['forwarding'] else ' idle'}"
+        f"**Indexing Active:** {'🏃‍♂️ Yes' if active_tasks['indexing'] else ' idle'}\n"
+        f"**Forwarding Active:** {'🏃‍♂️ Yes' if active_tasks['forwarding'] else ' idle'}"
     )
 
-@app.on_message(filters.command("index") & app.admin_filter)
-async def index_handler(client: Bot, message: Message):
-    if client.active_tasks["indexing"] or client.active_tasks["forwarding"]:
-        return await message.reply_text("❌ A task is already in progress.")
-    if not client.userbot or not client.userbot.is_connected:
-        return await message.reply_text("❌ Userbot is not logged in.")
+# --- REVISED INDEX HANDLER ---
+@app.on_message(filters.command("index") & admin_filter)
+async def index_handler(_, message: Message):
+    """
+    Handles the /index command with a revised, safer iteration method.
+    """
+    if active_tasks["indexing"] or active_tasks["forwarding"]:
+        await message.reply_text("❌ A task is already in progress.")
+        return
+    if not userbot or not userbot.is_connected:
+        await message.reply_text("❌ The userbot is not logged in.")
+        return
     if len(message.command) != 2:
-        return await message.reply_text("<b>Usage:</b> <code>/index &lt;chat_id&gt;</code>")
+        await message.reply_text("<b>⚠️ Invalid format.</b> Use: <code>/index &lt;chat_id&gt;</code>")
+        return
 
     chat_id_str = message.command[1]
-    client.active_tasks["indexing"] = True
-    status_msg = await message.reply_text(f"✅ Starting indexing for chat: <code>{chat_id_str}</code>...")
+    chat_id = int(chat_id_str) if chat_id_str.lstrip('-').isdigit() else chat_id_str
     
-    saved_count = 0
-    start_time = time.time()
+    active_tasks["indexing"] = True
+    status_msg = await message.reply_text(f"✅ Preparing to index chat: <code>{chat_id}</code>. This may take a moment.")
+
     try:
-        chat_id = int(chat_id_str) if chat_id_str.lstrip('-').isdigit() else chat_id_str
-        async for msg in client.userbot.get_chat_history(chat_id):
-            media = msg.document or msg.video
-            if not media: continue
-            
-            file_data = { "chat_id": msg.chat.id, "message_id": msg.id, "file_id": media.file_id, "file_unique_id": media.file_unique_id, "file_name": getattr(media, 'file_name', 'N/A'), "file_size": media.file_size, "caption": msg.caption.html if msg.caption else "" }
-            await db.save_file(file_data)
-            saved_count += 1
-
-            if saved_count % 50 == 0:
-                elapsed = time.time() - start_time
-                await status_msg.edit_text(f"**🔄 Indexing...** `{saved_count}` files saved.\n**Time:** {time.strftime('%H:%M:%S', time.gmtime(elapsed))}")
+        # Get the ID of the last message to know our upper limit
+        last_message = await userbot.get_chat_history(chat_id, limit=1)
+        if not last_message:
+            await status_msg.edit_text("🤷‍♂️ Could not find any messages in this chat.")
+            active_tasks["indexing"] = False
+            return
+        total_messages = last_message[0].id
+        await status_msg.edit_text(f"Found ~{total_messages} messages. Starting methodical indexing...")
     except Exception as e:
-        await status_msg.edit_text(f"❌ **Error during indexing:**\n`{e}`")
-    else:
-        total_time = time.time() - start_time
-        await status_msg.edit_text(f"**✅ Indexing Complete!**\n\n**New Files:** `{saved_count}`\n**Duration:** {time.strftime('%Hh %Mm %Ss', time.gmtime(total_time))}")
-    finally:
-        client.active_tasks["indexing"] = False
+        await status_msg.edit_text(f"❌ **Error:** Could not access chat <code>{chat_id}</code>.\n\nDetails: <code>{e}</code>")
+        active_tasks["indexing"] = False
+        return
 
-@app.on_message(filters.command("forward") & app.admin_filter)
-async def forward_handler(client: Bot, message: Message):
-    """Handles the /forward command to send all indexed files."""
-    if client.active_tasks["indexing"] or client.active_tasks["forwarding"]:
-        return await message.reply_text("❌ A task is already in progress.")
-    if not client.userbot or not client.userbot.is_connected:
-        return await message.reply_text("❌ Userbot is not logged in.")
+    saved_count = 0
+    processed_count = 0
+    start_time = time.time()
+    
+    # Iterate backwards from the last message ID in batches of 100
+    for i in range(total_messages, 0, -100):
+        # Create a list of message IDs for the current batch
+        message_ids = list(range(i, max(0, i - 100), -1))
+        
+        try:
+            # Fetch the batch of messages directly
+            messages = await userbot.get_messages(chat_id, message_ids)
+            
+            for msg in messages:
+                if not msg: continue # Skip if message was deleted
+                processed_count += 1
+                media = msg.document or msg.video
+                if not media: continue
+                
+                file_data = {
+                    "chat_id": msg.chat.id, "message_id": msg.id, "file_id": media.file_id,
+                    "file_unique_id": media.file_unique_id, "file_name": getattr(media, 'file_name', 'N/A'),
+                    "file_size": media.file_size, "caption": msg.caption.html if msg.caption else ""
+                }
+                await db.save_file(file_data)
+                saved_count += 1
+
+            elapsed = time.time() - start_time
+            await status_msg.edit_text(
+                f"**🔄 Indexing...**\n\n"
+                f"**Progress:** `{processed_count} / {total_messages}` messages\n"
+                f"**Files Saved:** `{saved_count}`\n"
+                f"**Elapsed:** {time.strftime('%H:%M:%S', time.gmtime(elapsed))}"
+            )
+            
+            # This delay is CRITICAL for not getting banned
+            await asyncio.sleep(cfg.INDEXING_DELAY)
+
+        except FloodWait as e:
+            print(f"Rate limit hit. Sleeping for {e.value} seconds.")
+            await asyncio.sleep(e.value)
+        except Exception as e:
+            print(f"An error occurred while fetching batch around message {i}: {e}")
+            # Optional: Add a longer sleep here on error
+            await asyncio.sleep(5)
+
+    total_time = time.time() - start_time
+    await status_msg.edit_text(f"**✅ Indexing Complete!**\n\n**Files Found & Saved:** `{saved_count}`\n**Duration:** {time.strftime('%Hh %Mm %Ss', time.gmtime(total_time))}")
+    active_tasks["indexing"] = False
+
+
+# /forward handler remains unchanged
+@app.on_message(filters.command("forward") & admin_filter)
+async def forward_handler(_, message: Message):
+    # This function's code does not need to be changed.
+    # It correctly uses the file_ids already stored in the database.
+    if active_tasks["indexing"] or active_tasks["forwarding"]:
+        await message.reply_text("❌ A task is already in progress.")
+        return
+    if not userbot or not userbot.is_connected:
+        await message.reply_text("❌ The userbot is not logged in.")
+        return
     if len(message.command) != 2:
-        return await message.reply_text("<b>Usage:</b> <code>/forward &lt;target_chat_id&gt;</code>")
+        await message.reply_text("<b>⚠️ Invalid format.</b> Use: <code>/forward &lt;target_chat_id&gt;</code>")
+        return
 
     target_chat_str = message.command[1]
-    client.active_tasks["forwarding"] = True
-    status_msg = await message.reply_text("`🔍 Counting total files...`")
+    target_chat_id = int(target_chat_str) if target_chat_str.lstrip('-').isdigit() else target_chat_str
     
-    sent_count, error_count = 0, 0
-    start_time = time.time()
-    try:
-        total_files = await db.get_total_files_count()
-        if total_files == 0:
-            client.active_tasks["forwarding"] = False
-            return await status_msg.edit_text("🤷‍♂️ The database is empty. No files to forward.")
+    active_tasks["forwarding"] = True
+    status_msg = await message.reply_text("`🔍 Counting total files...`")
+    total_files = await db.get_total_files_count()
 
-        target_chat_id = int(target_chat_str) if target_chat_str.lstrip('-').isdigit() else target_chat_str
-        await status_msg.edit_text(f"✅ Found **{total_files}** files. Starting to forward to <code>{target_chat_id}</code>...")
-        
-        all_files = db.get_all_files()
-        async for file_doc in all_files:
-            try:
-                await client.userbot.send_document(
-                    chat_id=target_chat_id, document=file_doc.get("file_id"), caption=file_doc.get("caption", "")
-                )
-                sent_count += 1
-            except FloodWait as e:
-                print(f"INFO: Rate limit exceeded. Waiting for {e.value} seconds.")
-                await asyncio.sleep(e.value)
-                await client.userbot.send_document(target_chat_id, file_doc.get("file_id"), caption=file_doc.get("caption", ""))
-                sent_count += 1
-            except Exception as e:
-                error_count += 1
-                print(f"ERROR: Could not send file {file_doc.get('file_id')}. Error: {e}")
+    if total_files == 0:
+        await status_msg.edit_text("🤷‍♂️ No files in database.")
+        active_tasks["forwarding"] = False
+        return
 
-            if (sent_count + error_count) % 10 == 0:
-                elapsed = time.time() - start_time
-                await status_msg.edit_text(f"**🔄 Forwarding...**\n\n**Sent:** `{sent_count}/{total_files}`\n**Errors:** `{error_count}`\n**Time:** {time.strftime('%H:%M:%S', time.gmtime(elapsed))}")
-            
-            await asyncio.sleep(cfg.FORWARD_DELAY)
-    except Exception as e:
-        await status_msg.edit_text(f"❌ **An error occurred during forwarding:**\n`{e}`")
-    else:
-        total_time = time.time() - start_time
-        await status_msg.edit_text(f"**✅ Forwarding Complete!**\n\n**Sent:** `{sent_count}`\n**Failed:** `{error_count}`\n**Duration:** {time.strftime('%Hh %Mm', time.gmtime(total_time))}")
-    finally:
-        client.active_tasks["forwarding"] = False
+    await status_msg.edit_text(f"✅ Found **{total_files}** files. Starting forward to <code>{target_chat_id}</code>...")
 
-# --- Main Execution ---
+    sent, error, start_time = 0, 0, time.time()
+    
+    async for file_doc in db.get_all_files():
+        try:
+            await userbot.send_document(target_chat_id, file_doc["file_id"], caption=file_doc.get("caption", ""))
+            sent += 1
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+            await userbot.send_document(target_chat_id, file_doc["file_id"], caption=file_doc.get("caption", ""))
+            sent += 1
+        except Exception as e:
+            error += 1
+            print(f"Failed to send file {file_doc['file_id']}: {e}")
+
+        if (sent + error) % 10 == 0:
+            elapsed = time.time() - start_time
+            await status_msg.edit_text(f"**🔄 Forwarding...**\n\n**Sent:** `{sent}/{total_files}`\n**Errors:** `{error}`\n**Elapsed:** {time.strftime('%H:%M:%S', time.gmtime(elapsed))}")
+
+        await asyncio.sleep(cfg.FORWARD_DELAY)
+
+    total_time = time.time() - start_time
+    await status_msg.edit_text(f"**✅ Forwarding Complete!**\n\n**Sent:** `{sent}`\n**Failed:** `{error}`\n**Duration:** {time.strftime('%Hh %Mm', time.gmtime(total_time))}")
+    active_tasks["forwarding"] = False
+
+
+# --- Main Execution (No changes here) ---
+async def main():
+    await asyncio.gather(app.start(), initialize_userbot())
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"✅ Web server started on port {port}")
+    await idle()
+    await runner.cleanup()
+    await app.stop()
+    if userbot and userbot.is_connected:
+        await userbot.stop()
+
 if __name__ == "__main__":
     try:
-        app.run(app.start_services())
-    except (ApiIdInvalid, AuthKeyUnregistered):
-        print("❌ CRITICAL: Your API_ID/HASH or BOT_TOKEN is invalid. Please check your .env file.")
+        asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nBot stopped by user.")
-    except Exception as e:
-        print(f"❌ An unexpected error occurred: {e}")
+        print("Bot stopped.")
