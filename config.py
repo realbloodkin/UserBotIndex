@@ -7,7 +7,6 @@ load_dotenv()
 class Config:
     """
     Loads configuration variables from environment settings.
-    This is a secure way to handle sensitive data like API keys.
     """
     try:
         # --- Essential Credentials ---
@@ -21,16 +20,17 @@ class Config:
         SESSION_STRING = os.environ.get("SESSION_STRING", None)
 
         # --- Behavior Settings ---
-        FORWARD_DELAY = int(os.environ.get("FORWARD_DELAY", 2))
+        FORWARD_DELAY = int(os.environ.get("FORWARD_DELAY", 2)) # Delay for /forward command
 
-        # --- Web Server Settings (ADD THIS) ---
-        # The port for the web service. Render.com will set this automatically.
-        # Defaults to 8080 if not set.
-        PORT = int(os.environ.get("PORT", 8080))
+        # --- NEW: Delay for the /index command ---
+        # Delay in seconds between fetching batches of messages during indexing.
+        # A higher value (5-10s) is safer for restricted chats but slower.
+        # A lower value (1-2s) is faster for normal chats.
+        INDEXING_DELAY = int(os.environ.get("INDEXING_DELAY", 3))
 
     except (ValueError, TypeError) as e:
-        print(f"Error loading configuration: One of the environment variables is missing or has the wrong type. Details: {e}")
+        print(f"Error loading configuration: {e}")
         exit(1)
 
-# Create an instance of the configuration to be imported by other modules
+# Create an instance of the configuration
 cfg = Config()
